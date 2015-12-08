@@ -60,7 +60,7 @@ class MapModule(mp_module.MPModule):
     
         mpstate.map.add_callback(functools.partial(self.map_callback))
         self.add_command('map', self.cmd_map, "map control", ['icon',
-                                      'set (MAPSETTING)'])
+                                      'set (MAPSETTING)', 'overlay', 'service'])
         self.add_completion_function('(MAPSETTING)', self.map_settings.completion)
 
         self.default_popup = MPMenuSubMenu('Popup', items=[])
@@ -94,6 +94,10 @@ class MapModule(mp_module.MPModule):
     def cmd_map(self, args):
         '''map commands'''
         from MAVProxy.modules.mavproxy_map import mp_slipmap
+        # Sanity check
+        if len(args) < 1:
+            print("Usage: map <icon|set|sethome|overlay|service> <args>")
+            return
         if args[0] == "icon":
             if len(args) < 3:
                 print("Usage: map icon <lat> <lon> <icon>")
@@ -113,8 +117,39 @@ class MapModule(mp_module.MPModule):
             self.mpstate.map.add_object(mp_slipmap.SlipBrightness(self.map_settings.brightness))
         elif args[0] == "sethome":
             self.cmd_set_home(args)
-        else:
-            print("usage: map <icon|set>")
+        elif args[0] == "overlay":
+            if (len(args) < 2) or (len(args) == 3) or (len(args) == 5):
+                print("Usage: map overlay <file path> [<lat> <lon> [<width> <height>]]")
+            else:
+                overlay_filepath = args[1]
+                overlay_latlon_in_filename = True
+                overlay_size_in_filename = True
+                # Default values (strings):
+                overlay_lat    = ""
+                overlay_lon    = ""
+                overlay_width  = ""
+                overlay_height = ""
+                
+                if len(args) >= 3:
+                    overlay_lat = args[2]
+                    overlay_lon = args[3]
+                    overlay_latlon_in_filename = False
+                    
+                    if len(args) >= 6:
+                        overlay_width = args[4]
+                        overlay_height = args[5]
+                        overlay_size_in_filename = False
+                
+                self.mpstate.map.add_object(mp_slipmap.SlipOverlay(overlay_filepath,
+                                                  overlay_latlon_in_filename, overlay_lat, overlay_lon,
+                                                  overlay_size_in_filename, overlay_width, overlay_height))
+                
+        elif args[0] == "service":
+            if len(args) < 2:
+                print("Usage: map service <name>")
+            else:
+                service = args[1]
+                self.mpstate.map.add_object(mp_slipmap.SlipService(service))
     
     def display_waypoints(self):
         '''display the waypoints'''

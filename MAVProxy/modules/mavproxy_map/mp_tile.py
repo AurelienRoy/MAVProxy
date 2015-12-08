@@ -19,6 +19,7 @@ import os
 import sys
 import string
 import time
+import re
 
 try:
 	import cv2.cv as cv
@@ -147,6 +148,243 @@ class TileInfo:
 		return url.substitute(tile_info)
 
 
+class ImageOverlayInfo:
+	'''description of a tile'''
+	def __init__(self, tile, filepath, center_lat=None, center_lon=None, width_meters=None, height_meters=None):
+		self.tile = tile
+		
+		# Absolute file path
+		self.filepath = filepath
+		
+		self.img = None
+		self.center_lat = center_lat
+		self.center_lon = center_lon
+		self.width_meters  = width_meters
+		self.height_meters = height_meters
+		self.size_pix_x = None;
+		self.size_pix_y = None;
+		self.pix_per_meter = None
+
+	def key(self):
+		'''image cache key'''
+		return (self.tile, self.filepath)
+
+	# offset is from the top left corner
+	def coord(self, offset=(0,0)):
+		'''return lat,lon within a tile given (offsetx,offsety)'''
+		if self.size_pix_x is None:
+			return (0,0)
+		
+		# Converts as pixel offset from the center
+		(offsetx, offsety) = offset
+		offset_center_x = offsetx - self.size_pix_x/2
+		offset_center_y = offsety - self.size_pix_y/2
+		
+		# Converts from pixels to meters
+		meters_north = -offset_center_y / self.pix_per_meter
+		meters_east  =  offset_center_x / self.pix_per_meter
+		
+		lat = self.center_lat + (meters_north / mp_util.radius_of_earth)
+		lon = self.center_lon + (meters_east / (mp_util.radius_of_earth * math.cos(lat)))
+		
+		lon = mp_util.wrap_valid_longitude(lon)
+		return (lat, lon)
+
+	def extent_meters(self):
+		'''return tile size as (width,height) in meters'''
+		return (self.width_meters, self.height_meters)
+
+	def size_pixels(self):
+		'''return tile size as (width,height) in pixels'''
+		return (self.size_pix_x, self.size_pix_y)
+
+	def resolution(self):
+		'''return image resolution in pixel per meters [pix/m]'''
+		return self.pix_per_meter
+	
+	def distance(self, lat, lon):
+		'''distance of this tile from a given lat/lon'''
+		return mp_util.gps_distance(lat, lon, self.center_lat, self.center_lon)
+
+	def path(self):
+		'''return absolute path of tile image'''
+		return self.filepath
+	
+	def get_img(self):
+		'''returns the image pixel array'''
+		if self.img is None:
+			return self.load_img()
+		return self.img
+	
+	def load_img(self):
+		'''returns the loaded image or None in case of error'''
+		try:
+			ret = cv.LoadImage(self.filepath)
+			#ret = cv2.imread(self.filepath, 1)	  # change 1 for -1 to also retrieve the alpha channel
+			self.img = ret
+			
+			#height, width = self.img.shape[:2]
+			self.size_pix_x = self.img.width
+			self.size_pix_y = self.img.height
+			
+			self.pix_per_meter = self.size_pix_x / self.width_meters
+			#print("pix_per_meter = %f [pix/m]" % self.pix_per_meter)
+			
+			# TODO: read pixel dimensions
+			# Computer 'pix_per meters' from 'width_meters'
+			return ret
+		except IOError as e:
+			# windows gives errno 0 for some versions of python, treat that as ENOENT
+			# and try a download
+			print("Failed to load image %s" % self.filepath)
+			self.img = None
+			if not e.errno in [errno.ENOENT,0]:
+				raise
+			pass
+		return None
+	
+	def is_img_loaded(self):
+		'''returns false if the image is not loaded, which indicates an error
+		   occured during its loading'''
+		return (not (self.img is None))
+	
+	'''
+	 Inputs:
+	   'view_lat','view_lon' are the coordinates of the top left corner
+	   
+	 Returns the tuple (is_within_view, img_topleft_north_meters, img_topleft_east_meters)
+		 is_within_view : true if this image covers at least partially the specified view
+		 img_topleft_north_meters, img_topleft_east_meters:
+			 coordinates of the corners of the image relative to the top left corner
+			 of the view.
+			 the North axis - NEGATIVE if further South than the top view corner
+			the East axis - positive if further East than the left view corner
+	'''
+	def pos_relative_to_view(self, view_lat, view_lon, view_width_meters, view_height_meters):
+		
+		# North = axis Y (positive towards North)
+		# East  = axis X (positive towards East)
+		
+		# The view ranges over:
+		#   [0 to view_width_meters] on the East direction
+		#   [0 to -view_height_meters] on the North direction
+		
+		# Local coordinates (in meters) of the view:
+		view_left_x   = 0
+		view_right_x  = view_width_meters
+		view_top_y	= 0
+		view_bottom_y = -view_height_meters
+		
+		# View bounds as (X,Y, width, height)
+		view_bounds = (0, 0, view_width_meters, view_height_meters)
+		
+		(pos_view2img_y, pos_view2img_x) = mp_util.gps_distance_north_east(view_lat, view_lon, self.center_lat, self.center_lon)
+		
+		# Local coordinates (in meters) of the image:
+		img_left_x   = pos_view2img_x - self.width_meters / 2
+		img_top_y	= pos_view2img_y + self.height_meters / 2
+		
+		# Image bounds as (X,Y, width, height), Y is inverted for the overlap test
+		img_bounds = (img_left_x, -img_top_y, self.width_meters, self.height_meters)
+		
+		img_topleft_north_meters = img_top_y
+		img_topleft_east_meters  = img_left_x
+		
+		is_within_view = mp_util.bounds_overlap(view_bounds, img_bounds)
+		return (is_within_view, img_topleft_north_meters, img_topleft_east_meters)
+		
+		
+# Stand alone function
+# Extracts from a filename the latitude, longitude, and width/height properties.
+# These properties fully describe the location and size of an overlay image.
+def get_overlay_full_properties_from_filepath(filepath):
+	''' Example of input strings:
+	   my_map_lat45.6524_lon45.025_w100_h100.png
+	   '''
+	latitude_pattern  = r"_lat([-+]?\d*\.\d+|\d+)"		 # e.g: "lat45.624" , "lat.350", "lat-65"
+	longitude_pattern = r"_lon([-+]?\d*\.\d+|\d+)"		 # e.g: "lon45.624" , "lon.350", "lon-65"
+	width_pattern	 = r"_w(\d*\.\d+|\d+)m"			   # e.g: "w100m", "w35.50m"
+	height_pattern	= r"_h(\d*\.\d+|\d+)m"			   # e.g: "h100m", "h35.50m"
+	# The preceeding 'r' is for raw string, so backslashes are not interpreted.
+	
+	full_pattern = latitude_pattern + longitude_pattern + width_pattern + height_pattern + r"$"
+	
+	# Retrieves the file name without its directory path nor its extension
+	filename_ext = os.path.basename(filepath)
+	filename = os.path.splitext(filename_ext)[0]
+	
+	# Performs the regexp search
+	searchObj = re.search(full_pattern,  filename, re.I)
+	if searchObj:
+		lat	= float(searchObj.group(1))
+		lon	= float(searchObj.group(2))
+		width  = float(searchObj.group(3))
+		height = float(searchObj.group(4))
+		return (lat, lon, width, height)
+	else:
+		return None
+
+# Stand alone function
+# Extracts from a filename the width/height properties, latitude and longitude strings
+# being passed as arguments.
+# These properties fully describe the location and size of an overlay image.
+def get_overlay_size_properties_from_filepath(filepath, lat_str, lon_str):
+	''' Example of input strings:
+	   my_map_w100_h100.png
+	   '''
+	width_pattern	 = r"_w(\d*\.\d+|\d+)m"			   # e.g: "w100m", "w35.50m"
+	height_pattern	= r"_h(\d*\.\d+|\d+)m"			   # e.g: "h100m", "h35.50m"
+	# The preceeding 'r' is for raw string, so backslashes are not interpreted.
+	
+	full_pattern = width_pattern + height_pattern + r"$"
+	
+	# Retrieves the file name without its directory path nor its extension
+	filename_ext = os.path.basename(filepath)
+	filename = os.path.splitext(filename_ext)[0]
+	
+	# Performs the regexp search
+	searchObj = re.search(full_pattern,  filename, re.I)
+	if searchObj:
+		lat	= float(lat_str)
+		lon	= float(lon_str)
+		width  = float(searchObj.group(1))
+		height = float(searchObj.group(2))
+		return (lat, lon, width, height)
+	else:
+		return None
+	
+# Stand alone function
+# Converts latitude, longitude, width, height strings arguments into numerical values.
+# These properties fully describe the location and size of an overlay image.
+def get_overlay_properties_from_arguments(lat_str, lon_str, width_str, height_str):
+	# Converts strings into numerical values
+	lat	= float(lat_str)
+	lon	= float(lon_str)
+	width  = float(width_str)
+	height = float(height_str)
+	return (lat, lon, width, height)
+	
+	
+	
+class ImgOverlayInfoScaled:
+	'''information on a tile with scale information and placement'''
+	def __init__(self, zoom, scale, pos_view2img):
+		self.scale = scale
+		self.zoom  = zoom
+		(self.is_within_view,
+		 self.img_topleft_north_meters,
+		 self.img_topleft_east_meters) = pos_view2img
+		self.img_topleft_x = None
+		self.img_topleft_y = None
+		
+	def compute_view2img_pos_pixels(self,view_resolution):
+		'''Computes the position of the top-left corner of the image,
+		 relative to the top-left corner of the view, in pixels.
+		 'view_resolution' is in [pix/m] '''
+		self.img_topleft_x =  self.img_topleft_east_meters  * view_resolution
+		self.img_topleft_y = -self.img_topleft_north_meters * view_resolution
+
+
 class TileInfoScaled(TileInfo):
 	'''information on a tile with scale information and placement'''
 	def __init__(self, tile, zoom, scale, src, dst, service):
@@ -182,7 +420,8 @@ class MPTile:
 		self.service = service
 		self.debug = debug
                 self.refresh_age = refresh_age
-
+		self.img_overlay = None
+		
 		if service not in TILE_SERVICES:
 			raise TileException('unknown tile service %s' % service)
 
@@ -238,7 +477,69 @@ class MPTile:
 		'''
 		tile = self.coord_to_tile(lat, lon, zoom)
 		return self.tile_to_path(tile)
-
+	
+	def add_image_overlay(self, filepath):
+		'''add/replace the overlay map image from the filepath to an image
+		   the image should contain in its name its center location and
+		   width, height in meters'''
+		# Tries to parse the image name to get its properties (coordinates, width, height)
+		overlay_props = get_overlay_full_properties_from_filepath(filepath)
+		if overlay_props is None:
+			print("The selected image '%s' does not have a proper overlay name." % filepath)
+			print("Its name should follow the format:")
+			print("  <image_name>_lat<latitude>_lon<longitude>_w<width>m_h<height>m.<bmp|jpg|png>")
+			print("	 <latitude> :  latitude of the center of the image, as a float value")
+			print("	 <longitude> : longitude of the center of the image, as a float value")
+			print("	 <width> :	 width in meters of the image map, as a positive float value")
+			print("	 <height> :	height in meters of the image map, as a positive float value")
+			print("   example:  my_image_lat45.624_lon-36.452_w100m_h150.25m.png")
+			return False
+		# Creates the overlay from the image path and location/size property tuple
+		return self.add_image_overlay_with_properties(filepath, overlay_props)
+	
+	def add_image_overlay_at_latlon(self, filepath, lat_str, lon_str):
+		'''add/replace the overlay map image from the filepath to an image
+		   the image should contain in its name its width, height in meters'''
+		# Tries to parse the image name to get its properties (coordinates, width, height)
+		overlay_props = get_overlay_size_properties_from_filepath(filepath, lat_str, lon_str)
+		if overlay_props is None:
+			print("The selected image '%s' does not have a proper overlay name." % filepath)
+			print("Its name should follow the format:")
+			print("  <image_name>_w<width>m_h<height>m.<bmp|jpg|png>")
+			print("	 <width> :	 width in meters of the image map, as a positive float value")
+			print("	 <height> :	height in meters of the image map, as a positive float value")
+			print("   example:  my_image_lat45.624_lon-36.452_w100m_h150.25m.png")
+			return False
+		# Creates the overlay from the image path and location/size property tuple
+		return self.add_image_overlay_with_properties(filepath, overlay_props)
+	
+	def add_image_overlay_at_latlon_size(self, filepath, lat_str, lon_str, width_str, height_str):
+		'''add/replace the overlay map image from the filepath to an image '''
+		# Converts the lat, lon, width, height string properties into an location/size property tuple
+		overlay_props = get_overlay_properties_from_arguments(lat_str, lon_str, width_str, height_str)
+		# Creates the overlay from the image path and location/size property tuple
+		return self.add_image_overlay_with_properties(filepath, overlay_props)
+	
+	def add_image_overlay_with_properties(self, filepath, overlay_props):
+		# Creates the image overlay
+		(center_lat, center_lon, width_meter, height_meter) = overlay_props
+		self.img_overlay = ImageOverlayInfo("overlay", filepath, center_lat, center_lon, width_meter, height_meter)
+		
+		# Tries to load the image file
+		img = self.img_overlay.load_img()
+		if img is None:
+			# Destroys the image object
+			self.img_overlay = None
+			return False
+		else:
+			print("Loaded overlay image centered on lat=%f° lon=%f°, with size w=%.1f h=%.1f meters"
+				  % (center_lat, center_lon, width_meter, height_meter))
+		return True
+	
+	def remove_image_overlay(self):
+		'''removes any loaded overlay map image'''
+		self.img_overlay = None
+	
 	def tiles_pending(self):
 		'''return number of tiles pending download'''
 		return len(self._download_pending)
@@ -526,6 +827,44 @@ class MPTile:
 			srcy = 0
 		return ret
 
+	
+	def area_to_image_overlay(self, lat, lon, width, height, ground_width, zoom=None):
+		'''return a list of ImgOverlayInfoScaled objects needed for
+		an area of land, with ground_width in meters, and
+		width/height in pixels.
+
+		lat/lon is the top left corner. If unspecified, the
+		zoom is automatically chosen to avoid having to grow
+		the tiles
+		'''
+
+		pixel_width = ground_width / float(width)
+		ground_height = ground_width * (height/(float(width)))
+
+		# choose a zoom level if not provided
+		# The zoom option is currently not supported for overlay images.
+		# In the future, overlay images should be a collection of images
+		# at different zoom levels, and the 'zoom' option should serve
+		# to pick one or the other.
+		
+		# 'pixel_width' is in [m/pxl] and 'img_overlay' resolution is in [pxl/m]
+		scale = pixel_width * self.img_overlay.resolution()
+		
+		pos_view2img = self.img_overlay.pos_relative_to_view(lat, lon, ground_width, ground_height)
+		(is_within_view, img_topleft_north_meters, img_topleft_east_meters) = pos_view2img
+		
+		if is_within_view:
+			img_scaled_info = ImgOverlayInfoScaled(zoom, scale, pos_view2img)
+			
+			# Computes the resolution in pixels per meters [pxl/m]
+			view_resolution = float(width) / ground_width
+			img_scaled_info.compute_view2img_pos_pixels(view_resolution)
+		else:
+			img_scaled_info = None
+		
+		return img_scaled_info
+	
+	
 	def area_to_image(self, lat, lon, width, height, ground_width, zoom=None, ordered=True):
 		'''return an RGB image for an area of land, with ground_width
 		in meters, and width/height in pixels.
@@ -533,7 +872,7 @@ class MPTile:
 		lat/lon is the top left corner. The zoom is automatically
 		chosen to avoid having to grow the tiles'''
 
-		img = cv.CreateImage((width,height),8,3)
+		img_view = cv.CreateImage((width,height),8,3)
 
 		tlist = self.area_to_tile_list(lat, lon, width, height, ground_width, zoom)
 
@@ -550,15 +889,65 @@ class MPTile:
 			h = min(height - t.dsty, scaled_tile.height - t.srcy)
 			if w > 0 and h > 0:
 				cv.SetImageROI(scaled_tile, (t.srcx, t.srcy, w, h))
-				cv.SetImageROI(img, (t.dstx, t.dsty, w, h))
-				cv.Copy(scaled_tile, img)
-				cv.ResetImageROI(img)
+				cv.SetImageROI(img_view, (t.dstx, t.dsty, w, h))
+				cv.Copy(scaled_tile, img_view)
+				cv.ResetImageROI(img_view)
 				cv.ResetImageROI(scaled_tile)
 
+		#  And now we add the overlay image
+		if (not (self.img_overlay is None)) and (self.img_overlay.is_img_loaded()):
+			# Creates a ScaledImageOverlay object, which keeps the dimensions of the scaled image
+			# It should also assess if the image overlay is within the view
+			scaled_img_info = self.area_to_image_overlay(lat, lon, width, height, ground_width, zoom)
+			
+			# If the image overlay does not overlap the view, then 'scaled_img_info' is None
+			if not (scaled_img_info is None):
+				# Then crop the image parts that lie outside the view
+				
+				scaled_img = self.scale_image(self.img_overlay, scaled_img_info)
+				
+				# The top-left position of the ROI within the view are the coordinates
+				# 'img_topleft_x', unless these lie outside the view (< 0)
+				# (they cannot lie on the outside of the bottom-right borders, otherwise
+				# the image would not be overlapping at all the view) 
+				dst_view_x = max(0, int(scaled_img_info.img_topleft_x))
+				dst_view_y = max(0, int(scaled_img_info.img_topleft_y))
+				
+				# The top-left position of the ROI within the image is 0,0
+				# unless the image lies outside the left/top borders of the view
+				src_img_x = dst_view_x - int(scaled_img_info.img_topleft_x)
+				src_img_y = dst_view_y - int(scaled_img_info.img_topleft_y)
+				
+				# Dimensions of the ROI in both the view and the image
+				# (for they now have the same scaling)
+				# It is the overlapping area between the image and the view.
+				width_in_view  = min(width - dst_view_x, int(scaled_img.width) - src_img_x)
+				height_in_view = min(height - dst_view_y, int(scaled_img.height) - src_img_y)
+				
+				if (width_in_view > 0) and (height_in_view > 0):
+					cv.SetImageROI(scaled_img, (src_img_x, src_img_y, width_in_view, height_in_view))
+					cv.SetImageROI(img_view, (dst_view_x, dst_view_y, width_in_view, height_in_view))
+					# Copies the ROI part of the image into the ROI part of the view
+					cv.Copy(scaled_img, img_view)
+					cv.ResetImageROI(img_view)
+					cv.ResetImageROI(scaled_img)
+		
 		# return as an RGB image
-		cv.CvtColor(img, img, cv.CV_BGR2RGB)
-		return img
+		cv.CvtColor(img_view, img_view, cv.CV_BGR2RGB)
+		return img_view
 
+	def scale_image(self, img, scaled_img_info):
+		'''returns a scaled image'''
+		(width, height) = img.size_pixels()
+		scaled_width = int(width / scaled_img_info.scale)
+		scaled_height = int(height / scaled_img_info.scale)
+		# Creates an empty canvas to welcome the scaled image
+		scaled_img = cv.CreateImage((scaled_width,scaled_height), 8, 3)
+		# Scales the image to the canvas
+		cv.Resize(img.get_img(), scaled_img)
+		return scaled_img
+	
+	
 def mp_icon(filename):
         '''load an icon from the data directory'''
         # we have to jump through a lot of hoops to get an OpenCV image

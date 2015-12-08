@@ -38,6 +38,30 @@ def gps_distance(lat1, lon1, lat2, lon2):
     c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0-a))
     return radius_of_earth * c
 
+def gps_distance_north_east(lat1, lon1, lat2, lon2):
+    '''calculates the North and East distances from location 1 to location 2, in meters.
+    The North distance is positive when (lat2 > lat1)
+    The East distance if positive when (lon2 > lon1)
+    Input coordinates are in degrees
+    
+    Warning: This function does not properly handle North/South pole crossing
+    '''
+    dLat_deg = lat2 - lat1
+    dLon_deg = lon2 - lon1  
+    # Wraps longitudes
+    if dLon_deg > 180:
+        dLon_deg = dLon_deg - 360
+    
+    dLat = math.radians(dLat_deg)
+    dLon = math.radians(dLon_deg)
+    latMid = math.radians((lat1+lat2)/2)
+    
+    north_meters = dLat * radius_of_earth;
+    east_meters  = dLon * radius_of_earth * math.cos(latMid)
+    # The East distance in meters varies with the latitude,
+    # therefore we use an approximation, at the middle between lat1 and lat2
+    
+    return (north_meters, east_meters)
 
 def gps_bearing(lat1, lon1, lat2, lon2):
     '''return bearing between two points in degrees, in range 0-360

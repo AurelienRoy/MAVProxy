@@ -409,6 +409,22 @@ class SlipBrightness:
     def __init__(self, brightness):
         self.brightness = brightness
 
+class SlipOverlay:
+    '''an object to specify an overlay image filepath'''
+    def __init__(self, filepath, latlon_in_filename, lat, lon, size_in_filename, width, height):
+        self.filepath = filepath
+        self.latlon_in_filename = latlon_in_filename
+        self.lat = lat
+        self.lon = lon
+        self.size_in_filename = size_in_filename
+        self.width = width
+        self.height = height
+
+class SlipService:
+    '''an object to specify a map service'''
+    def __init__(self, service):
+        self.service = service
+
 class SlipClearLayer:
     '''remove all objects in a layer'''
     def __init__(self, layer):

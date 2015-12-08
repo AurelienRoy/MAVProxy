@@ -42,7 +42,8 @@ class MPSlipMapFrame(wx.Frame):
                                                     MPMenuRadio('Service', 'Select map service',
                                                                 returnkey='setService',
                                                                 selected=state.mt.get_service(),
-                                                                items=state.mt.get_service_list())])])
+                                                                items=state.mt.get_service_list()),
+                                                                MPMenuItem('Overlay Image Map\t', 'Add a map image', 'overlayImageMap')])])
         self.SetMenuBar(self.menu.wx_menu())
         self.Bind(wx.EVT_MENU, self.on_menu)
 
@@ -85,8 +86,20 @@ class MPSlipMapFrame(wx.Frame):
             state.brightness *= 1.25
         elif ret.returnkey == 'decreaseBrightness':
             state.brightness /= 1.25
+        elif ret.returnkey == 'overlayImageMap':
+            self.select_overlay_image()
         state.need_redraw = True
 
+    def select_overlay_image(self):
+        '''pops-up a file selection window to let the user select an overlay image'''
+        dlg = wx.FileDialog(self, message="Select an overlay image map...", defaultDir=os.getcwd(), defaultFile="", style=wx.OPEN)
+        # Call the dialog as a model-dialog so we're required to choose Ok or Cancel
+        if dlg.ShowModal() == wx.ID_OK:
+            # User has selected something, get the path, set the
+            filepath = dlg.GetPath()
+            self.state.mt.add_image_overlay(filepath)
+        dlg.Destroy() # we don't need the dialog any more so we ask it to clean-up
+   
     def find_object(self, key, layers):
         '''find an object to be modified'''
         state = self.state
@@ -182,6 +195,26 @@ class MPSlipMapFrame(wx.Frame):
                 state.brightness = obj.brightness
                 state.need_redraw = True
 
+            if isinstance(obj, SlipOverlay):
+                # add an overlay image
+                if obj.size_in_filename:
+                    if obj.latlon_in_filename:
+                        # All properties should be contained within the file name:
+                        state.mt.add_image_overlay(obj.filepath)
+                    else:
+                        # Be careful, here 'obj.lat' and 'obj.lon' are strings
+                        state.mt.add_image_overlay_at_latlon(obj.filepath, obj.lat, obj.lon)
+                else:
+                    # Be careful, here 'obj.lat', 'obj.lon', width, height are strings
+                    state.mt.add_image_overlay_at_latlon_size(obj.filepath, obj.lat, obj.lon, obj.width, obj.height)
+                state.need_redraw = True
+                
+            if isinstance(obj, SlipService):
+                # set new map service
+                # TODO: change the MPRadio selection on the menu bar
+                state.mt.set_service(obj.service)
+                state.need_redraw = True
+            
             if isinstance(obj, SlipClearLayer):
                 # remove all objects from a layer
                 if obj.layer in state.layers:
